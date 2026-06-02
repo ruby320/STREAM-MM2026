@@ -59,6 +59,8 @@ ALL_OPTS=(
   "8bit-Adam-bnb"
   "MDQAdamW-Simple"
   "MDQAdamW-Simple-FusedIO"
+  "GaLore"
+  "Adam-mini"
 )
 # shellcheck disable=SC2206
 OPTS=(${OPTS:-${ALL_OPTS[@]}})
@@ -77,48 +79,51 @@ if ! ls stquant_timetest_cpp*.so 1>/dev/null 2>&1; then
   python setup.py build_ext --inplace
 fi
 
-EXTRA_ARGS=()
-if [ -n "$MICRO_LIST" ]; then
-  EXTRA_ARGS+=(--micro-list "$MICRO_LIST")
-else
-  EXTRA_ARGS+=(--micro-min "$MICRO_MIN" --micro-max "$MICRO_MAX")
-  if [ "$FIND_MAX_MICRO" = "1" ]; then
-    EXTRA_ARGS+=(--find-max-micro --search-mode "$MICRO_SEARCH_MODE")
-  fi
-fi
-if [ -n "$PEAK_BUDGET_GB" ]; then
-  EXTRA_ARGS+=(--peak-budget-gb "$PEAK_BUDGET_GB")
-fi
-if [ "$MICRO_BENCHMARK" = "1" ]; then
-  EXTRA_ARGS+=(--benchmark)
-fi
-if [ "$MICRO_BENCHMARK_FALLBACK" = "0" ]; then
-  EXTRA_ARGS+=(--no-benchmark-fallback)
-fi
-
 mkdir -p "$OUTPUT_DIR"
 
 run_sweep() {
   local opt="$1"
-  if [ "$NUM_GPUS" -le 1 ]; then
+  local common_args=(
+    --optimizer "$opt"
+    --grad-accum "$GRAD_ACCUM"
+    --warmup-steps "$MICRO_WARMUP_STEPS"
+    --probe-steps "$MICRO_PROBE_STEPS"
+    --benchmark-steps "$MICRO_BENCHMARK_STEPS"
+    --output-dir "$OUTPUT_DIR"
+  )
+  if [ -n "$PEAK_BUDGET_GB" ]; then
+    common_args+=(--peak-budget-gb "$PEAK_BUDGET_GB")
+  fi
+  if [ "$MICRO_BENCHMARK" = "1" ]; then
+    common_args+=(--benchmark)
+  fi
+  if [ "$MICRO_BENCHMARK_FALLBACK" = "0" ]; then
+    common_args+=(--no-benchmark-fallback)
+  fi
+
+  # find-max 默认走 orchestrate：每个 micro 独立子进程，避免 OOM 后 NCCL 死锁
+  if [ "$FIND_MAX_MICRO" = "1" ] && [ -z "$MICRO_LIST" ]; then
     python microbatch_sweep.py \
-      --optimizer "$opt" \
-      --grad-accum "$GRAD_ACCUM" \
-      --warmup-steps "$MICRO_WARMUP_STEPS" \
-      --probe-steps "$MICRO_PROBE_STEPS" \
-      --benchmark-steps "$MICRO_BENCHMARK_STEPS" \
-      --output-dir "$OUTPUT_DIR" \
-      "${EXTRA_ARGS[@]}"
+      --orchestrate \
+      "${common_args[@]}" \
+      --micro-min "$MICRO_MIN" \
+      --micro-max "$MICRO_MAX" \
+      --search-mode "$MICRO_SEARCH_MODE"
+    return
+  fi
+
+  if [ -n "$MICRO_LIST" ]; then
+    common_args+=(--micro-list "$MICRO_LIST")
+  else
+    common_args+=(--micro-min "$MICRO_MIN" --micro-max "$MICRO_MAX")
+  fi
+
+  if [ "$NUM_GPUS" -le 1 ]; then
+    python microbatch_sweep.py "${common_args[@]}"
   else
     torchrun --standalone --nproc_per_node="$NUM_GPUS" \
       microbatch_sweep.py \
-      --optimizer "$opt" \
-      --grad-accum "$GRAD_ACCUM" \
-      --warmup-steps "$MICRO_WARMUP_STEPS" \
-      --probe-steps "$MICRO_PROBE_STEPS" \
-      --benchmark-steps "$MICRO_BENCHMARK_STEPS" \
-      --output-dir "$OUTPUT_DIR" \
-      "${EXTRA_ARGS[@]}"
+      "${common_args[@]}"
   fi
 }
 

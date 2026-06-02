@@ -112,3 +112,27 @@ torchrun --standalone --nproc_per_node=4 microbatch_sweep.py \
   --optimizer MDQAdamW-Simple-FusedIO --find-max-micro --search-mode exp_binary \
   --micro-min 4 --micro-max 64 --benchmark
 ```
+
+---
+
+## Fixed Global Batch=256（公平对比 micro / step 时间）
+
+固定 `micro×accum×GPUs=256`，从大到小找 max micro，再测 `Benchmark_Avg_Global_Step_ms`。
+
+**默认 2 卡**（`P=128`，合法 micro 含 128/64/32…，比 4 卡多高档位）：
+
+```bash
+cd /workspace/rebuttal/CUDA
+CUDA_VISIBLE_DEVICES=4,5 NUM_GPUS=2 bash run_fixed_global_batch_sweep.sh
+```
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `NUM_GPUS` | **2** | 须整除 `FIXED_GLOBAL_BATCH` |
+| `FIXED_GLOBAL_BATCH` | 256 | 与 baseline token batch 一致 |
+| `FIXED_G_OUTPUT_DIR` | `results/fixed_global_batch_2gpu` | 2 卡结果目录 |
+| `OPTS` | 32bit / bnb / FusedIO | 三个 optimizer |
+
+4 卡重跑：设 `NUM_GPUS=4`、`FIXED_G_OUTPUT_DIR=results/fixed_global_batch`。
+
+输出：`g256_sweep_{opt}.csv`、`g256_sweep_all.csv`（含 `Benchmark_Max_OK_Micro`、`Benchmark_Avg_Global_Step_ms`）。

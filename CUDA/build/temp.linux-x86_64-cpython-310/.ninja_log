@@ -1,0 +1,3 @@
+# ninja log v5
+0	26424	1780369085536814805	/workspace/rebuttal/CUDA/build/temp.linux-x86_64-cpython-310/stquant_core.o	41949aac03947edf
+0	195397	1780369254478980109	/workspace/rebuttal/CUDA/build/temp.linux-x86_64-cpython-310/stquant_kernel.o	7ac67e9ec0e0163a

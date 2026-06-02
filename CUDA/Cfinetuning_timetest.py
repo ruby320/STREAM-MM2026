@@ -29,6 +29,21 @@ from encoder_layer_backward_profiler import EncoderLayerBackwardProfiler
 from stquant_opt_fused_io import MDQAdamWSimpleFusedIO
 from stquant_opt_simple import MDQAdamWSimple
 
+try:
+    from adam_mini import Adam_mini
+except ImportError:
+    Adam_mini = None
+
+try:
+    from galore_torch import GaLoreAdamW
+except ImportError:
+    GaLoreAdamW = None
+
+GALORE_RANK = int(os.environ.get("GALORE_RANK", "128"))
+GALORE_UPDATE_PROJ_GAP = int(os.environ.get("GALORE_UPDATE_PROJ_GAP", "200"))
+GALORE_SCALE = float(os.environ.get("GALORE_SCALE", "0.25"))
+GALORE_PROJ_TYPE = os.environ.get("GALORE_PROJ_TYPE", "std")
+
 # ================= 配置（对齐 baseline/pretrain_gpt.py）=================
 MODEL_TYPE = "gpt2-xl"
 DATA_PATH = "/workspace/data/openwebtext_processed"
@@ -44,6 +59,8 @@ ALL_OPTIMIZERS = [
     "MDQAdamW-Simple-FusedIO",
     "AdamW-32bit",
     "8bit-Adam-bnb",
+    "GaLore",
+    "Adam-mini",
 ]
 
 DEBUG_MODE = os.environ.get("TIMETEST_DEBUG", "1") == "1"
@@ -87,6 +104,67 @@ def _mdq_common_kwargs(lr, layer_count, global_batch):
     )
 
 
+def _unwrap_model(model):
+    if hasattr(model, "module"):
+        return model.module
+    return model
+
+
+def build_adam_mini(model, config: GPT2Config, lr: float):
+    if Adam_mini is None:
+        raise ImportError("请先安装 adam-mini: pip install adam-mini")
+    m = _unwrap_model(model)
+    optimizer = Adam_mini(
+        named_parameters=m.named_parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=WEIGHT_DECAY,
+        dim=config.n_embd,
+        n_heads=config.n_head,
+        n_kv_heads=None,
+    )
+    optimizer.wqk_names.add("c_attn")
+    optimizer.wv_names.add("c_attn")
+    optimizer.attn_proj_names.add("attn.c_proj")
+    return optimizer
+
+
+def build_galore_optimizer(model, lr: float):
+    if GaLoreAdamW is None:
+        raise ImportError("请先安装 galore-torch: pip install galore-torch")
+    m = _unwrap_model(model)
+    no_decay = ["bias", "LayerNorm.weight"]
+    galore_params = []
+    non_galore_params = []
+    for name, p in m.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and not any(nd in name for nd in no_decay):
+            galore_params.append(p)
+        else:
+            non_galore_params.append(p)
+    param_groups = [
+        {"params": non_galore_params, "weight_decay": 0.0},
+        {
+            "params": galore_params,
+            "weight_decay": WEIGHT_DECAY,
+            "rank": GALORE_RANK,
+            "update_proj_gap": GALORE_UPDATE_PROJ_GAP,
+            "scale": GALORE_SCALE,
+            "proj_type": GALORE_PROJ_TYPE,
+        },
+    ]
+    return GaLoreAdamW(
+        param_groups,
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=WEIGHT_DECAY,
+        no_deprecation_warning=True,
+    )
+
+
 def build_optimizer(opt_name, model, lr, layer_count, global_batch):
     no_decay = ["bias", "LayerNorm.weight"]
     params = [
@@ -110,6 +188,11 @@ def build_optimizer(opt_name, model, lr, layer_count, global_batch):
         import bitsandbytes as bnb
 
         return bnb.optim.Adam8bit(params, lr=lr)
+    if opt_name == "Adam-mini":
+        config = GPT2Config.from_pretrained(MODEL_TYPE)
+        return build_adam_mini(model, config, lr)
+    if opt_name == "GaLore":
+        return build_galore_optimizer(model, lr)
     mdq_kw = _mdq_common_kwargs(lr, layer_count, global_batch)
     if opt_name == "MDQAdamW-Simple":
         return MDQAdamWSimple(model.parameters(), **mdq_kw)

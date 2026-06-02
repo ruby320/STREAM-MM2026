@@ -25,6 +25,7 @@ from transformers import (
     GPT2LMHeadModel,
     GPT2Tokenizer,
     default_data_collator,
+    get_linear_schedule_with_warmup,
     set_seed,
 )
 
@@ -58,13 +59,14 @@ TASK_CONFIGS = {
         "data_cache": os.path.join(_EXP_DIR, "..", "parameter", "wikitext103_tokenized"),
     },
     "roberta-large": {
-        "max_steps": 1000,
+        "num_epochs": 1,
         "batch_size": 8,
         "grad_accum_steps": 1,
         "lr": 2e-5,
         "weight_decay": 0.01,
-        "eval_batches": 500,
-        "log_interval": 50,
+        "warmup_ratio": 0.06,
+        "eval_batches": None,
+        "log_interval": 200,
         "layer_count": 24,
         "update_freq": 50,
     },
@@ -91,6 +93,12 @@ def parse_args():
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument(
+        "--num-epochs",
+        type=int,
+        default=None,
+        help="RoBERTa MNLI fine-tuning epochs (default: 1). Use 3 to match finetuning_glue.py.",
+    )
     p.add_argument("--run-id", type=str, default=None)
     p.add_argument("--list-runs", action="store_true")
     return p.parse_args()
@@ -180,6 +188,41 @@ def build_mdq_params(task_cfg: dict, threshold_scale: float) -> dict:
     t8, t16, t32 = scaled_thresholds(threshold_scale)
     p["thresholds"] = {"8": t8, "16": t16, "32": t32}
     return p
+
+
+def resolve_training_plan(
+    task: str,
+    task_cfg: dict,
+    train_loader_len: int,
+    max_steps_override: int | None,
+    num_epochs_override: int | None,
+) -> dict:
+    if task == "roberta-large":
+        num_epochs = (
+            num_epochs_override
+            if num_epochs_override is not None
+            else task_cfg.get("num_epochs", 1)
+        )
+        if max_steps_override is not None:
+            max_steps = max_steps_override
+        else:
+            max_steps = num_epochs * train_loader_len
+        warmup_ratio = task_cfg.get("warmup_ratio", 0.06)
+        warmup_steps = int(warmup_ratio * max_steps)
+        return {
+            "max_steps": max_steps,
+            "num_epochs": num_epochs,
+            "warmup_steps": warmup_steps,
+            "use_scheduler": True,
+        }
+
+    max_steps = max_steps_override or task_cfg["max_steps"]
+    return {
+        "max_steps": max_steps,
+        "num_epochs": None,
+        "warmup_steps": 0,
+        "use_scheduler": False,
+    }
 
 
 def build_optimizer(model, mode: str, task_cfg: dict, threshold_scale: float, batch_size: int):
@@ -326,7 +369,9 @@ def evaluate_lm(model, eval_loader, device, max_batches: int) -> float:
 
 
 @torch.no_grad()
-def evaluate_classification(model, eval_loader, device, max_batches: int) -> tuple[float, float]:
+def evaluate_classification(
+    model, eval_loader, device, max_batches: int | None
+) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -341,7 +386,7 @@ def evaluate_classification(model, eval_loader, device, max_batches: int) -> tup
         correct += (preds == batch["labels"]).sum().item()
         total += batch["labels"].numel()
         n_batches += 1
-        if n_batches >= max_batches:
+        if max_batches is not None and n_batches >= max_batches:
             break
     model.train()
     acc = correct / max(total, 1)
@@ -381,8 +426,6 @@ def train(args):
         return
 
     task_cfg = dict(TASK_CONFIGS[args.task])
-    if args.max_steps is not None:
-        task_cfg["max_steps"] = args.max_steps
 
     run_id = args.run_id or make_run_id(
         args.task, args.mode, args.threshold_scale if args.mode == "mdq" else None, args.seed
@@ -411,12 +454,36 @@ def train(args):
             task_cfg, device, rank, args.seed
         )
 
+    plan = resolve_training_plan(
+        args.task,
+        task_cfg,
+        len(train_loader),
+        args.max_steps,
+        args.num_epochs,
+    )
+    task_cfg["max_steps"] = plan["max_steps"]
+
     grad_accum = task_cfg.get("grad_accum_steps", 1)
     effective_batch = task_cfg["batch_size"] * world_size * grad_accum
     threshold_scale = args.threshold_scale if args.mode == "mdq" else 1.0
     optimizer = build_optimizer(
         model, args.mode, task_cfg, threshold_scale, effective_batch
     )
+
+    scheduler = None
+    if plan["use_scheduler"]:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=plan["warmup_steps"],
+            num_training_steps=plan["max_steps"],
+        )
+
+    if rank == 0 and args.task == "roberta-large":
+        print(
+            f"RoBERTa plan: epochs={plan['num_epochs']} "
+            f"steps={plan['max_steps']} warmup={plan['warmup_steps']} "
+            f"scheduler={'yes' if scheduler else 'no'}"
+        )
 
     if is_distributed():
         from torch.nn.parallel import DistributedDataParallel as DDP
@@ -446,6 +513,8 @@ def train(args):
 
         grad_norm = compute_grad_norm(model)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         step += 1
         last_train_loss = accum_loss if task_type == "lm" else accum_loss
 
@@ -484,6 +553,8 @@ def train(args):
         "task": args.task,
         "seed": args.seed,
         "max_steps": task_cfg["max_steps"],
+        "num_epochs": plan["num_epochs"],
+        "warmup_steps": plan["warmup_steps"],
         "optimizer": "AdamW-32bit" if args.mode == "adamw32" else "MDQ",
         "mode": args.mode,
         "threshold_scale": threshold_scale if args.mode == "mdq" else None,
